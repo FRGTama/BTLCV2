@@ -1,15 +1,15 @@
 """Reproducible prototype for CO3057 Project 2.
 
-All images are procedurally generated and are explicitly marked synthetic.
-The feature methods are educational NumPy/SciPy implementations: Harris
-corners with normalized local-patch descriptors, and FAST corners with
-oriented BRIEF descriptors (an ORB-style binary method).
+Input images are supplied by the user in ``assets/``. The feature methods
+are educational NumPy/SciPy implementations: Harris corners with normalized
+local-patch descriptors, and FAST corners with oriented BRIEF descriptors
+(an ORB-style binary method).
 """
 from __future__ import annotations
-import json, math, time
+import json, math, re, time
 from pathlib import Path
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image
 from scipy import ndimage, sparse
 from scipy.sparse.linalg import spsolve
 import matplotlib
@@ -19,176 +19,110 @@ import matplotlib.pyplot as plt
 ROOT = Path(__file__).resolve().parent
 ASSETS = ROOT / 'assets'
 RESULTS = ROOT / 'results'
-ASSETS.mkdir(exist_ok=True)
 RESULTS.mkdir(exist_ok=True)
-RNG = np.random.default_rng(407)
+
+IMAGE_SUFFIXES = {'.bmp', '.jpeg', '.jpg', '.png', '.tif', '.tiff', '.webp'}
 
 
 def save_rgb(arr, path):
     Image.fromarray(np.asarray(np.clip(arr, 0, 255), dtype=np.uint8), 'RGB').save(path)
 
 
-def gradient_background(w, h, top=(118, 181, 220), bottom=(218, 225, 220), seed=1):
-    rng = np.random.default_rng(seed)
-    y = np.linspace(0, 1, h, dtype=np.float32)[:, None, None]
-    a = np.array(top, dtype=np.float32)[None, None, :]
-    b = np.array(bottom, dtype=np.float32)[None, None, :]
-    out = a * (1-y) + b*y
-    out = np.broadcast_to(out, (h, w, 3)).copy()
-    noise = rng.normal(0, 2.2, (h, w, 1)).astype(np.float32)
-    out += noise
-    return np.uint8(np.clip(out, 0, 255))
+def image_files():
+    if not ASSETS.is_dir():
+        raise FileNotFoundError(
+            f'Create {ASSETS} and upload the input images there before running the script.'
+        )
+    paths = sorted(
+        path for path in ASSETS.iterdir()
+        if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
+    )
+    if not paths:
+        raise FileNotFoundError(f'No supported images found in {ASSETS}.')
+    return paths
 
 
-def make_panorama_scene():
-    w, h = 1680, 520
-    arr = gradient_background(w, h, (115, 176, 213), (224, 222, 192), 23)
-    im = Image.fromarray(arr, 'RGB')
-    d = ImageDraw.Draw(im, 'RGB')
-    # Distant hills and a textured foreground establish broad, low-frequency structure.
-    d.polygon([(0, 238),(190,190),(370,235),(560,182),(760,234),(980,180),(1180,230),(1390,178),(1680,228),(1680,520),(0,520)], fill=(93,126,99))
-    d.rectangle((0, 294, w, 520), fill=(165,150,119))
-    d.polygon([(0,355),(500,318),(1080,360),(1680,315),(1680,520),(0,520)], fill=(89,91,83))
-    d.line((0,355,w,315), fill=(223,211,177), width=9)
-    # Three connected building facades with dense, varied corners.
-    blocks = [(55,114,385,305),(416,86,772,306),(812,126,1145,310),(1182,92,1609,303)]
-    facade_cols=[(202,174,138),(173,185,180),(188,154,138),(173,171,151)]
-    for bi, box in enumerate(blocks):
-        x0,y0,x1,y1=box
-        col=facade_cols[bi]
-        d.rectangle(box, fill=col, outline=(55,58,56), width=5)
-        d.rectangle((x0,y0,x1,y0+21), fill=(75,78,72))
-        # Horizontal masonry bands.
-        for yy in range(y0+32,y1,45):
-            d.line((x0,yy,x1,yy+((bi%2)*2)), fill=(119,111,98), width=2)
-        wx=42 if bi%2==0 else 36
-        for yy in range(y0+40,y1-35,54):
-            for xx in range(x0+23,x1-20,wx):
-                ww=22 if (xx//wx)%2 else 25
-                hh=25 if (yy//54)%2 else 31
-                d.rectangle((xx,yy,xx+ww,yy+hh), fill=(42,68,78), outline=(237,219,177), width=3)
-                d.line((xx+ww//2,yy,xx+ww//2,yy+hh), fill=(219,209,184), width=2)
-                if (xx+yy+bi)%3==0:
-                    d.rectangle((xx+4,yy+5,xx+9,yy+10), fill=(255,223,126))
-        d.rectangle((x0+10,y1-41,x1-10,y1-30), fill=(122,92,68))
-        if bi in (1,3):
-            d.rectangle((x0+120,y1-79,x0+186,y1), fill=(88,69,54), outline=(219,206,175), width=3)
-    # Trees and lamps give non-repeating features across the overlap.
-    for x,y,r in [(22,274,46),(392,269,42),(787,275,52),(1160,268,45),(1640,276,48)]:
-        d.rectangle((x-6,y,x+7,370), fill=(81,63,45))
-        for dx,dy,rr in [(-21,-14,r),(20,-18,int(r*.85)),(0,-43,int(r*.8)),(-7,13,int(r*.7))]:
-            d.ellipse((x+dx-rr,y+dy-rr,x+dx+rr,y+dy+rr), fill=(49,105,73), outline=(38,82,62), width=2)
-    for x in (320, 710, 1070, 1480):
-        d.line((x,245,x,360), fill=(38,43,43), width=5)
-        d.line((x,245,x+28,236), fill=(38,43,43), width=4)
-        d.ellipse((x+20,229,x+38,242), fill=(252,231,169), outline=(50,50,43), width=2)
-    # Pavement seams, small signs, and deterministic texture patches.
-    for x in range(-30,w,52):
-        d.line((x,385,x+25,520), fill=(130,122,105), width=2)
-    for y in range(398,520,31):
-        d.line((0,y,w,y), fill=(126,118,103), width=2)
-    for x in (140, 545, 905, 1350):
-        d.rectangle((x,216,x+66,255), fill=(53,83,89), outline=(238,223,191), width=3)
-        d.text((x+8,228), ['CAFE','MARKET','HOTEL','BOOKS'][[140,545,905,1350].index(x)], fill=(245,236,203))
-    # Fine, deterministic noise makes the scene less vector-like and supplies texture.
-    out=np.asarray(im).astype(np.float32)
-    noise=np.random.default_rng(24).normal(0,2.0,(h,w,1))
-    out=np.clip(out+noise,0,255).astype(np.uint8)
-    save_rgb(out, ASSETS/'panorama_master_synthetic.png')
-    return out
+def role_match(path, aliases):
+    tokens = set(re.split(r'[^a-z0-9]+', path.stem.lower()))
+    return bool(tokens.intersection(aliases))
 
 
-def projective_about_center(w,h, angle_deg=0.0, scale=1.0, shear=0.0, px=0.0, py=0.0):
-    t1=np.array([[1,0,-w/2],[0,1,-h/2],[0,0,1]],float)
-    a=math.radians(angle_deg)
-    m=np.array([[scale*math.cos(a), -math.sin(a)+shear, 0],
-                [math.sin(a), scale*math.cos(a), 0],
-                [px,py,1]],float)
-    t2=np.array([[1,0,w/2],[0,1,h/2],[0,0,1]],float)
-    return t2@m@t1
+def find_role(paths, aliases, label):
+    matches = [path for path in paths if role_match(path, aliases)]
+    if len(matches) > 1:
+        names = ', '.join(path.name for path in matches)
+        raise ValueError(f'Use only one {label} image in {ASSETS}; found {names}.')
+    return matches[0] if matches else None
 
 
-def warp_from_scene(scene, H_scene_to_view, out_shape):
-    h,w=out_shape
-    yy,xx=np.mgrid[0:h,0:w]
-    q=np.stack([xx.ravel(),yy.ravel(),np.ones(h*w)])
-    scene_p=np.linalg.inv(H_scene_to_view)@q
-    scene_p/=scene_p[2:3,:]
-    sx=scene_p[0].reshape(h,w); sy=scene_p[1].reshape(h,w)
-    vals=[]
-    for c in range(3):
-        ch=ndimage.map_coordinates(scene[:,:,c].astype(np.float32),[sy,sx],order=1,mode='constant',cval=0)
-        vals.append(ch)
-    return np.stack(vals,axis=2)
+def load_rgb(path):
+    with Image.open(path) as image:
+        return np.asarray(image.convert('RGB'), dtype=np.uint8)
 
 
-def generate_panorama_views(scene):
-    h,w=480,720
-    offsets=[0,470,940]
-    params=[(0.0,1.0,0.0,0.0,0.0),(1.2,1.003,0.002,0.000003,-0.000002),(-1.0,0.997,-0.001,-0.000002,0.000003)]
-    views=[]; hs=[]
-    for i,(xoff,p) in enumerate(zip(offsets,params)):
-        P=projective_about_center(w,h,*p)
-        C=np.array([[1,0,-xoff],[0,1,0],[0,0,1]],float)
-        H=P@C
-        hs.append(H)
-        v=warp_from_scene(scene,H,(h,w))
-        save_rgb(v,ASSETS/f'panorama_view_{i+1}_synthetic.png')
-        views.append(np.uint8(np.clip(v,0,255)))
-    return views,hs
+def load_source_and_mask(paths):
+    source_path = find_role(paths, {'source', 'foreground', 'object', 'src'}, 'source')
+    background_path = find_role(
+        paths, {'background', 'destination', 'target', 'dest', 'bg'}, 'background'
+    )
+    mask_paths = [path for path in paths if path not in {source_path, background_path}]
+    mask_path = find_role(mask_paths, {'mask', 'silhouette', 'alpha'}, 'mask')
+    if source_path is None or background_path is None:
+        raise ValueError(
+            f'Upload images named source and background to {ASSETS} '
+            '(for example source.jpg and background.jpg).'
+        )
+
+    with Image.open(source_path) as image:
+        rgba = np.asarray(image.convert('RGBA'), dtype=np.uint8)
+    source = rgba[:, :, :3]
+    if mask_path is not None:
+        with Image.open(mask_path) as image:
+            mask = np.asarray(image.convert('L'), dtype=np.uint8)
+    elif np.any(rgba[:, :, 3] < 255):
+        mask = rgba[:, :, 3]
+    else:
+        raise ValueError(
+            f'Upload a mask image for {source_path.name}, or use a source PNG with transparency.'
+        )
+
+    destination = load_rgb(background_path)
+    if mask.shape != source.shape[:2]:
+        raise ValueError('The source image and mask must have identical dimensions.')
+    if source.shape[0] > destination.shape[0] or source.shape[1] > destination.shape[1]:
+        raise ValueError('The source image must fit inside the background image.')
+    if not np.any(mask):
+        raise ValueError('The uploaded mask must contain at least one non-zero pixel.')
+    offset = (
+        (destination.shape[1] - source.shape[1]) // 2,
+        (destination.shape[0] - source.shape[0]) // 2,
+    )
+    return source, mask, destination, offset, [source_path, background_path, mask_path]
 
 
-def make_composite_pair():
-    sw,sh=512,384
-    source=gradient_background(sw,sh,(91,166,211),(194,218,223),31)
-    src_im=Image.fromarray(source,'RGB')
-    sd=ImageDraw.Draw(src_im,'RGB')
-    # Light cloud bands for source context.
-    for cx,cy,rx in [(80,90,54),(405,84,72),(110,270,48),(425,286,58)]:
-        for dx,dy,rr in [(-20,0,rx*.55),(8,-12,rx*.65),(31,1,rx*.5)]:
-            sd.ellipse((cx+dx-rr,cy+dy-rr*.38,cx+dx+rr,cy+dy+rr*.38),fill=(220,235,237))
-    # Balloon and basket; object mask is a manual silhouette.
-    mask=Image.new('L',(sw,sh),0); md=ImageDraw.Draw(mask)
-    # Basket ropes first so the single object silhouette includes them.
-    balloon_box=(187,42,326,221)
-    sd.line((213,198,228,273),fill=(69,54,42),width=4)
-    sd.line((300,198,285,273),fill=(69,54,42),width=4)
-    sd.polygon([(221,267),(292,267),(284,308),(230,308)],fill=(132,82,49),outline=(64,48,36))
-    sd.line((229,278,285,278),fill=(224,178,102),width=4)
-    # A colorful paneled envelope.
-    sd.ellipse(balloon_box,fill=(203,62,43),outline=(85,45,39),width=5)
-    sd.pieslice(balloon_box,180,360,fill=(232,153,49),outline=(85,45,39),width=3)
-    sd.polygon([(187,131),(257,48),(257,219),(204,221)],fill=(222,83,48))
-    sd.polygon([(257,48),(326,131),(311,216),(257,219)],fill=(239,183,78))
-    sd.line((257,48,257,220),fill=(89,57,42),width=3)
-    sd.line((191,144,323,144),fill=(103,58,40),width=2)
-    sd.ellipse((236,300,277,318),fill=(48,47,40))
-    # Mask made from the envelope, ropes, basket, and burner silhouette.
-    md.ellipse(balloon_box,fill=255)
-    md.line((213,198,228,273),fill=255,width=7)
-    md.line((300,198,285,273),fill=255,width=7)
-    md.polygon([(217,263),(296,263),(291,313),(224,313)],fill=255)
-    md.ellipse((231,295,282,322),fill=255)
-    source=np.asarray(src_im)
-    mask=np.asarray(mask)
-
-    dw,dh=760,480
-    dest=gradient_background(dw,dh,(137,190,220),(203,218,211),47)
-    dest_im=Image.fromarray(dest,'RGB'); d=ImageDraw.Draw(dest_im,'RGB')
-    # Layered hills with fine grass stripes.
-    d.polygon([(0,286),(180,230),(350,285),(520,222),(760,278),(760,480),(0,480)],fill=(92,135,98))
-    d.polygon([(0,335),(160,299),(335,337),(550,286),(760,335),(760,480),(0,480)],fill=(69,112,77))
-    for x in range(0,dw,17):
-        y=350+int(18*math.sin(x/62))
-        d.line((x,y,x+10,y-10),fill=(132,154,92),width=2)
-    for cx,cy,r in [(94,273,36),(630,255,46),(700,285,31),(350,302,23)]:
-        d.rectangle((cx-5,cy,cx+5,cy+82),fill=(79,61,43))
-        for dx,dy,rr in [(-15,-7,r*.7),(14,-9,r*.65),(0,-25,r*.8)]:
-            d.ellipse((cx+dx-rr,cy+dy-rr,cx+dx+rr,cy+dy+rr),fill=(48,100,65))
-    dest=np.asarray(dest_im)
-    # Place the source object in the upper-right sky region.
-    x0,y0=220,42
-    return source,mask,dest,(x0,y0)
+def load_panorama_views(paths, excluded_paths):
+    excluded = {path for path in excluded_paths if path is not None}
+    view_names = [
+        path for path in paths
+        if path not in excluded and role_match(path, {'view', 'frame'})
+    ]
+    panorama_names = [
+        path for path in paths
+        if path not in excluded and role_match(path, {'panorama'})
+        and re.search(r'\d', path.stem)
+    ]
+    named_views = view_names if len(view_names) >= 2 else panorama_names
+    view_paths = named_views if len(named_views) >= 2 else [path for path in paths if path not in excluded]
+    if len(view_paths) < 2:
+        raise ValueError(
+            f'Upload at least two panorama images to {ASSETS}; '
+            'name them view_1, view_2, and so on when other input images are present.'
+        )
+    views = [load_rgb(path) for path in view_paths]
+    shape = views[0].shape
+    if any(view.shape != shape for view in views[1:]):
+        raise ValueError('All panorama images must have identical dimensions.')
+    return views, view_paths
 
 
 def poisson_clone(source, mask, target, offset):
@@ -432,7 +366,7 @@ def gray(rgb):
     return 0.299*a[:,:,0]+0.587*a[:,:,1]+0.114*a[:,:,2]
 
 
-def run_feature_method(views,Hs,method):
+def run_feature_method(views,method):
     gray_views=[gray(v) for v in views]
     extractor=harris_ncc_features if method=='Harris-NCC' else orb_style_features
     desc_kind='float' if method=='Harris-NCC' else 'binary'
@@ -444,19 +378,16 @@ def run_feature_method(views,Hs,method):
     for i in range(len(views)-1):
         p1,d1=features[i]; p2,d2=features[i+1]
         matches=match_descriptors(d1,d2,desc_kind,ratio=0.70 if desc_kind=='float' else 0.88)
-        Hgt=Hs[i+1]@np.linalg.inv(Hs[i])
         src=p1[matches[:,0]] if len(matches) else np.empty((0,2))
         dst=p2[matches[:,1]] if len(matches) else np.empty((0,2))
         H,inliers,rmse=ransac_homography(src,dst,threshold=4.0,iterations=850,seed=70+i)
         if H is None or not np.all(np.isfinite(H)) or abs(np.linalg.det(H)) < 1e-10:
             # Identity is only a fail-safe for rendering; metrics retain the failure.
             H=np.eye(3)
-        true_pts=np.array([[0,0],[719,0],[719,479],[0,479],[360,240]],float)
-        geom=float(np.sqrt(np.mean(np.sum((transform_points(H,true_pts)-transform_points(Hgt,true_pts))**2,axis=1))))
         results.append({'pair':f'{i+1}-{i+2}','keypoints_a':int(len(p1)),'keypoints_b':int(len(p2)),
                         'tentative_matches':int(len(matches)),'inliers':int(inliers.sum()),
                         'inlier_ratio':float(inliers.mean()) if len(inliers) else 0.0,
-                        'inlier_rmse_px':float(rmse),'homography_corner_rmse_px':geom})
+                        'inlier_rmse_px':float(rmse)})
         pair_matches.append(H)
     # Matrices mapping each image into view 1 coordinates.
     for H in pair_matches:
@@ -471,7 +402,7 @@ def plot_composites(target,direct,poisson,mask,offset):
     items=[(target,'Background'),(np.dstack([mask]*3),'Manual object mask'),(direct,'Direct replacement'),(poisson,'Poisson gradient-domain')]
     for ax,(im,title) in zip(axs,items):
         ax.imshow(im);ax.set_title(title,fontsize=10);ax.axis('off')
-    fig.suptitle('Gradient-domain editing (synthetic demonstration)',fontsize=14)
+    fig.suptitle('Gradient-domain editing from uploaded images',fontsize=14)
     fig.tight_layout();fig.savefig(RESULTS/'gradient_editing_comparison.png',dpi=180,bbox_inches='tight');plt.close(fig)
     crop=(slice(offset[1]-10,offset[1]+mask.shape[0]+10),slice(offset[0]-10,offset[0]+mask.shape[1]+10))
     fig,axs=plt.subplots(1,3,figsize=(11,4))
@@ -482,32 +413,34 @@ def plot_composites(target,direct,poisson,mask,offset):
 
 def plot_panorama(views,pano_sift,pano_orb):
     fig=plt.figure(figsize=(14,8))
-    grid=fig.add_gridspec(2,6,height_ratios=[1,1.15],hspace=.22,wspace=.08)
+    columns=max(2*len(views),4)
+    grid=fig.add_gridspec(2,columns,height_ratios=[1,1.15],hspace=.22,wspace=.08)
     for i,view in enumerate(views):
         ax=fig.add_subplot(grid[0,2*i:2*i+2]);ax.imshow(view);ax.set_title(f'View {i+1}');ax.axis('off')
-    ax=fig.add_subplot(grid[1,0:3]);ax.imshow(pano_sift);ax.set_title('Harris-NCC panorama');ax.axis('off')
-    ax=fig.add_subplot(grid[1,3:6]);ax.imshow(pano_orb);ax.set_title('ORB-style panorama');ax.axis('off')
-    fig.suptitle('Feature-based stitching on a generated three-view scene',fontsize=14)
+    middle=columns//2
+    ax=fig.add_subplot(grid[1,0:middle]);ax.imshow(pano_sift);ax.set_title('Harris-NCC panorama');ax.axis('off')
+    ax=fig.add_subplot(grid[1,middle:]);ax.imshow(pano_orb);ax.set_title('ORB-style panorama');ax.axis('off')
+    fig.suptitle('Feature-based stitching from uploaded images',fontsize=14)
     fig.savefig(RESULTS/'panorama_results.png',dpi=180,bbox_inches='tight');plt.close(fig)
 
 
 def main():
     # Part 1: direct baseline and discrete Poisson solve.
-    source,mask,dest,offset=make_composite_pair()
+    paths=image_files()
+    source,mask,dest,offset,composite_paths=load_source_and_mask(paths)
     direct=direct_clone(source,mask,dest,offset)
     t0=time.perf_counter();poisson=poisson_clone(source,mask,dest,offset);poisson_time=time.perf_counter()-t0
-    save_rgb(source,ASSETS/'gradient_source_synthetic.png');save_rgb(dest,ASSETS/'gradient_background_synthetic.png')
-    Image.fromarray(mask).save(ASSETS/'gradient_manual_mask.png')
     save_rgb(direct,RESULTS/'gradient_direct.png');save_rgb(poisson,RESULTS/'gradient_poisson.png')
     metrics={'gradient_domain':{'mask_pixels':int((mask>0).sum()),'direct_boundary_edge_mean_l1':seam_edge_mean(direct,mask,offset),
-      'poisson_boundary_edge_mean_l1':seam_edge_mean(poisson,mask,offset),'poisson_runtime_s':poisson_time}}
+      'poisson_boundary_edge_mean_l1':seam_edge_mean(poisson,mask,offset),'poisson_runtime_s':poisson_time,
+      'input_files':[path.name for path in composite_paths if path is not None]}}
     plot_composites(dest,direct,poisson,mask,offset)
     # Part 2: one common pipeline for two descriptor families.
-    scene=make_panorama_scene();views,Hs=generate_panorama_views(scene)
-    sift,ps,_=run_feature_method(views,Hs,'Harris-NCC')
-    orb,po,_=run_feature_method(views,Hs,'ORB-style')
-    metrics['stitching']={'synthetic_view_count':len(views),'view_shape':list(views[0].shape[:2]),
-       'ground_truth_transform_note':'Known projective transforms used only to calculate homography corner RMSE.',
+    views,view_paths=load_panorama_views(paths,composite_paths)
+    sift,ps,_=run_feature_method(views,'Harris-NCC')
+    orb,po,_=run_feature_method(views,'ORB-style')
+    metrics['stitching']={'view_count':len(views),'view_shape':list(views[0].shape[:2]),
+       'input_files':[path.name for path in view_paths],
        'methods':[sift,orb]}
     plot_panorama(views,ps,po)
     (RESULTS/'metrics.json').write_text(json.dumps(metrics,indent=2),encoding='utf-8')
